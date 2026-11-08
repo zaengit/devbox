@@ -1,0 +1,27 @@
+pkgname=devbox
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Native development environment manager'
+arch=('x86_64' 'aarch64')
+url='https://github.com/devbox-project/devbox'
+license=('MIT')
+depends=('alsa-lib' 'libxkbcommon' 'wayland' 'libx11' 'libxcursor' 'libxi' 'libxrandr' 'vulkan-icd-loader')
+makedepends=('cargo' 'cmake' 'pkgconf')
+optdepends=('xdg-desktop-portal: native file picker integration')
+source=("devbox::git+https://github.com/devbox-project/devbox.git#tag=v${pkgver}")
+sha256sums=('SKIP')
+
+build() {
+  cd "$srcdir/devbox"
+  cargo build --locked --release -p devbox-app
+}
+
+package() {
+  cd "$srcdir/devbox"
+  install -Dm755 target/release/devbox-app "$pkgdir/usr/bin/devbox"
+  install -Dm644 packaging/devbox.desktop "$pkgdir/usr/share/applications/devbox.desktop"
+  install -Dm644 assets/icons/boxes.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/devbox.svg"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/devbox/LICENSE"
+  install -Dm644 assets/icons/LICENSE-lucide.txt "$pkgdir/usr/share/licenses/devbox/LICENSE-lucide.txt"
+  install -Dm644 README.md "$pkgdir/usr/share/doc/devbox/README.md"
+}

@@ -1,0 +1,10 @@
+Package: devbox
+Version: 0.1.0
+Section: devel
+Priority: optional
+Architecture: any
+Maintainer: Devbox contributors
+Description: Native development environment manager
+ Devbox discovers installed host runtimes, runs projects as the current user,
+ and manages explicitly configured user-owned service processes.
+Depends: ${shlibs:Depends}, ${misc:Depends}, libasound2, libxkbcommon0, libwayland-client0, libx11-6, libxcursor1, libxi6, libxrandr2, libvulkan1, xdg-desktop-portal

@@ -1,0 +1,13 @@
+[package]
+name = "devbox-icons"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+build = "build.rs"
+
+[dependencies]
+iced = { version = "0.14", features = ["svg"] }
+
+[build-dependencies]
+roxmltree = "0.20"
+

@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Devbox
+Comment=Manage native development projects and services
+Exec=devbox
+Icon=devbox
+Terminal=false
+Categories=Development;Utility;
+StartupNotify=true
