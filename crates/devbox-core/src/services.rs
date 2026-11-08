@@ -23,6 +23,37 @@ pub struct ServiceSnapshot {
     pub endpoint_ports: Vec<u16>,
     pub reachable_port: Option<u16>,
     pub state: ServiceState,
+    #[serde(default)]
+    pub systemd_unit: Option<String>,
+    #[serde(default)]
+    pub systemd_active_state: Option<String>,
+    #[serde(default)]
+    pub systemd_sub_state: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HostServiceAction {
+    Start,
+    Stop,
+    Restart,
+}
+
+impl HostServiceAction {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Start => "Start",
+            Self::Stop => "Stop",
+            Self::Restart => "Restart",
+        }
+    }
+
+    fn systemctl_verb(self) -> &'static str {
+        match self {
+            Self::Start => "start",
+            Self::Stop => "stop",
+            Self::Restart => "restart",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -353,6 +384,7 @@ struct ServiceDefinition {
     binaries: &'static [&'static str],
     processes: &'static [&'static str],
     ports: &'static [u16],
+    systemd_units: &'static [&'static str],
 }
 
 const SERVICES: &[ServiceDefinition] = &[
@@ -363,6 +395,7 @@ const SERVICES: &[ServiceDefinition] = &[
         binaries: &["mysqld", "mariadbd"],
         processes: &["mysqld", "mariadbd"],
         ports: &[3306],
+        systemd_units: &["mariadb.service", "mysql.service"],
     },
     ServiceDefinition {
         id: "postgresql",
@@ -371,6 +404,7 @@ const SERVICES: &[ServiceDefinition] = &[
         binaries: &["postgres"],
         processes: &["postgres", "postmaster"],
         ports: &[5432],
+        systemd_units: &["postgresql.service"],
     },
     ServiceDefinition {
         id: "mongodb",
@@ -379,6 +413,81 @@ const SERVICES: &[ServiceDefinition] = &[
         binaries: &["mongod"],
         processes: &["mongod"],
         ports: &[27017],
+        systemd_units: &["mongod.service"],
+    },
+    ServiceDefinition {
+        id: "clickhouse",
+        name: "ClickHouse",
+        category: "Database",
+        binaries: &["clickhouse-server"],
+        // Linux truncates the process comm field to 15 bytes.
+        processes: &["clickhouse-serv"],
+        ports: &[8123],
+        systemd_units: &["clickhouse-server.service"],
+    },
+    ServiceDefinition {
+        id: "cockroachdb",
+        name: "CockroachDB",
+        category: "Database",
+        binaries: &["cockroach"],
+        processes: &["cockroach"],
+        ports: &[26257],
+        systemd_units: &["cockroach.service", "cockroachdb.service"],
+    },
+    ServiceDefinition {
+        id: "mssql",
+        name: "Microsoft SQL Server",
+        category: "Database",
+        binaries: &["sqlservr"],
+        processes: &["sqlservr"],
+        ports: &[1433],
+        systemd_units: &["mssql-server.service"],
+    },
+    ServiceDefinition {
+        id: "couchdb",
+        name: "CouchDB",
+        category: "Database",
+        binaries: &["couchdb"],
+        processes: &[],
+        ports: &[5984],
+        systemd_units: &["couchdb.service"],
+    },
+    ServiceDefinition {
+        id: "neo4j",
+        name: "Neo4j",
+        category: "Database",
+        binaries: &["neo4j"],
+        processes: &[],
+        ports: &[7474, 7687],
+        systemd_units: &["neo4j.service"],
+    },
+    ServiceDefinition {
+        id: "etcd",
+        name: "etcd",
+        category: "Service discovery",
+        binaries: &["etcd"],
+        processes: &["etcd"],
+        ports: &[2379],
+        systemd_units: &["etcd.service"],
+    },
+    ServiceDefinition {
+        id: "consul",
+        name: "Consul",
+        category: "Service discovery",
+        binaries: &["consul"],
+        processes: &["consul"],
+        ports: &[8500],
+        systemd_units: &["consul.service"],
+    },
+    ServiceDefinition {
+        id: "zookeeper",
+        name: "ZooKeeper",
+        category: "Message broker",
+        binaries: &["zkServer.sh"],
+        // ZooKeeper runs on Java; matching the generic JVM process would be misleading.
+        processes: &[],
+        ports: &[2181],
+        systemd_units: &["zookeeper.service"],
     },
     ServiceDefinition {
         id: "redis",
@@ -387,6 +496,7 @@ const SERVICES: &[ServiceDefinition] = &[
         binaries: &["redis-server"],
         processes: &["redis-server"],
         ports: &[6379],
+        systemd_units: &["redis-server.service", "redis.service"],
     },
     ServiceDefinition {
         id: "valkey",
@@ -395,6 +505,110 @@ const SERVICES: &[ServiceDefinition] = &[
         binaries: &["valkey-server"],
         processes: &["valkey-server"],
         ports: &[6379],
+        systemd_units: &["valkey-server.service", "valkey.service"],
+    },
+    ServiceDefinition {
+        id: "memcached",
+        name: "Memcached",
+        category: "Cache",
+        binaries: &["memcached"],
+        processes: &["memcached"],
+        ports: &[11211],
+        systemd_units: &["memcached.service"],
+    },
+    ServiceDefinition {
+        id: "varnish",
+        name: "Varnish",
+        category: "Cache",
+        binaries: &["varnishd"],
+        processes: &["varnishd"],
+        ports: &[6081],
+        systemd_units: &["varnish.service"],
+    },
+    ServiceDefinition {
+        id: "rabbitmq",
+        name: "RabbitMQ",
+        category: "Message broker",
+        binaries: &["rabbitmq-server"],
+        // The Erlang VM process name is shared by unrelated applications.
+        processes: &[],
+        ports: &[5672],
+        systemd_units: &["rabbitmq-server.service"],
+    },
+    ServiceDefinition {
+        id: "nats",
+        name: "NATS",
+        category: "Message broker",
+        binaries: &["nats-server"],
+        processes: &["nats-server"],
+        ports: &[4222],
+        systemd_units: &["nats-server.service", "nats.service"],
+    },
+    ServiceDefinition {
+        id: "kafka",
+        name: "Apache Kafka",
+        category: "Message broker",
+        binaries: &["kafka-server-start.sh"],
+        // Kafka runs on Java; matching the generic JVM process would be misleading.
+        processes: &[],
+        ports: &[9092],
+        systemd_units: &["kafka.service", "confluent-kafka.service"],
+    },
+    ServiceDefinition {
+        id: "elasticsearch",
+        name: "Elasticsearch",
+        category: "Search",
+        binaries: &["elasticsearch"],
+        processes: &["elasticsearch"],
+        ports: &[9200],
+        systemd_units: &["elasticsearch.service"],
+    },
+    ServiceDefinition {
+        id: "opensearch",
+        name: "OpenSearch",
+        category: "Search",
+        binaries: &["opensearch"],
+        // OpenSearch also runs on Java; avoid treating every JVM as this service.
+        processes: &[],
+        ports: &[9200],
+        systemd_units: &["opensearch.service"],
+    },
+    ServiceDefinition {
+        id: "meilisearch",
+        name: "Meilisearch",
+        category: "Search",
+        binaries: &["meilisearch"],
+        processes: &["meilisearch"],
+        ports: &[7700],
+        systemd_units: &["meilisearch.service"],
+    },
+    ServiceDefinition {
+        id: "typesense",
+        name: "Typesense",
+        category: "Search",
+        binaries: &["typesense-server"],
+        processes: &["typesense-serve"],
+        ports: &[8108],
+        systemd_units: &["typesense-server.service", "typesense.service"],
+    },
+    ServiceDefinition {
+        id: "qdrant",
+        name: "Qdrant",
+        category: "Search",
+        binaries: &["qdrant"],
+        processes: &["qdrant"],
+        ports: &[6333],
+        systemd_units: &["qdrant.service"],
+    },
+    ServiceDefinition {
+        id: "solr",
+        name: "Apache Solr",
+        category: "Search",
+        binaries: &["solr"],
+        // Solr runs on Java; matching the generic JVM process would be misleading.
+        processes: &[],
+        ports: &[8983],
+        systemd_units: &["solr.service"],
     },
     ServiceDefinition {
         id: "mailpit",
@@ -403,6 +617,7 @@ const SERVICES: &[ServiceDefinition] = &[
         binaries: &["mailpit"],
         processes: &["mailpit"],
         ports: &[1025, 8025],
+        systemd_units: &["mailpit.service"],
     },
     ServiceDefinition {
         id: "garage",
@@ -411,6 +626,61 @@ const SERVICES: &[ServiceDefinition] = &[
         binaries: &["garage"],
         processes: &["garage"],
         ports: &[3900],
+        systemd_units: &["garage.service"],
+    },
+    ServiceDefinition {
+        id: "minio",
+        name: "MinIO",
+        category: "Object storage",
+        binaries: &["minio"],
+        processes: &["minio"],
+        ports: &[9000],
+        systemd_units: &["minio.service", "minio-server.service"],
+    },
+    ServiceDefinition {
+        id: "mailhog",
+        name: "MailHog",
+        category: "Email",
+        binaries: &["MailHog"],
+        processes: &["MailHog"],
+        ports: &[1025, 8025],
+        systemd_units: &["mailhog.service"],
+    },
+    ServiceDefinition {
+        id: "localstack",
+        name: "LocalStack",
+        category: "Local cloud",
+        binaries: &["localstack"],
+        processes: &["localstack"],
+        ports: &[4566],
+        systemd_units: &["localstack.service"],
+    },
+    ServiceDefinition {
+        id: "influxdb",
+        name: "InfluxDB",
+        category: "Observability",
+        binaries: &["influxd"],
+        processes: &["influxd"],
+        ports: &[8086],
+        systemd_units: &["influxdb.service"],
+    },
+    ServiceDefinition {
+        id: "prometheus",
+        name: "Prometheus",
+        category: "Observability",
+        binaries: &["prometheus"],
+        processes: &["prometheus"],
+        ports: &[9090],
+        systemd_units: &["prometheus.service"],
+    },
+    ServiceDefinition {
+        id: "grafana",
+        name: "Grafana",
+        category: "Observability",
+        binaries: &["grafana", "grafana-server"],
+        processes: &["grafana", "grafana-server"],
+        ports: &[3000],
+        systemd_units: &["grafana-server.service"],
     },
     ServiceDefinition {
         id: "caddy",
@@ -419,6 +689,7 @@ const SERVICES: &[ServiceDefinition] = &[
         binaries: &["caddy"],
         processes: &["caddy"],
         ports: &[80, 443],
+        systemd_units: &["caddy.service"],
     },
     ServiceDefinition {
         id: "nginx",
@@ -427,6 +698,7 @@ const SERVICES: &[ServiceDefinition] = &[
         binaries: &["nginx"],
         processes: &["nginx"],
         ports: &[80, 443],
+        systemd_units: &["nginx.service"],
     },
     ServiceDefinition {
         id: "apache",
@@ -435,6 +707,43 @@ const SERVICES: &[ServiceDefinition] = &[
         binaries: &["apache2", "httpd"],
         processes: &["apache2", "httpd"],
         ports: &[80, 443],
+        systemd_units: &["apache2.service", "httpd.service"],
+    },
+    ServiceDefinition {
+        id: "traefik",
+        name: "Traefik",
+        category: "Web server",
+        binaries: &["traefik"],
+        processes: &["traefik"],
+        ports: &[80, 443],
+        systemd_units: &["traefik.service"],
+    },
+    ServiceDefinition {
+        id: "haproxy",
+        name: "HAProxy",
+        category: "Web server",
+        binaries: &["haproxy"],
+        processes: &["haproxy"],
+        ports: &[80, 443],
+        systemd_units: &["haproxy.service"],
+    },
+    ServiceDefinition {
+        id: "docker",
+        name: "Docker Engine",
+        category: "Container runtime",
+        binaries: &["dockerd"],
+        processes: &["dockerd"],
+        ports: &[],
+        systemd_units: &["docker.service"],
+    },
+    ServiceDefinition {
+        id: "containerd",
+        name: "containerd",
+        category: "Container runtime",
+        binaries: &["containerd"],
+        processes: &["containerd"],
+        ports: &[],
+        systemd_units: &["containerd.service"],
     },
 ];
 
@@ -448,10 +757,13 @@ pub async fn scan_services() -> Vec<ServiceSnapshot> {
     let discovered = tokio::task::spawn_blocking(discover_static)
         .await
         .unwrap_or_default();
+    let systemd_units = discover_systemd_units().await;
     let discovered = Arc::new(discovered);
+    let systemd_units = Arc::new(systemd_units);
     let definitions = SERVICES.to_vec();
     stream::iter(definitions.into_iter().map(|definition| {
         let discovered = Arc::clone(&discovered);
+        let systemd_units = Arc::clone(&systemd_units);
         async move {
             let reachable_port = stream::iter(definition.ports.iter().copied())
                 .map(|port| async move {
@@ -482,6 +794,7 @@ pub async fn scan_services() -> Vec<ServiceSnapshot> {
                 .get(definition.id)
                 .copied()
                 .unwrap_or_default();
+            let systemd = systemd_units.get(definition.id);
             let state = if process_count > 0 {
                 if reachable_port.is_some() || definition.ports.is_empty() {
                     ServiceState::Running
@@ -491,7 +804,10 @@ pub async fn scan_services() -> Vec<ServiceSnapshot> {
             } else if reachable_port.is_some() {
                 // A listener may be an externally managed service even when its server binary is not in PATH.
                 ServiceState::EndpointReachable
-            } else if executable_path.is_empty() {
+            } else if systemd.is_some_and(|unit| unit.active_state == "active") {
+                // This covers services such as Kafka whose actual process is a generic JVM.
+                ServiceState::Running
+            } else if executable_path.is_empty() && systemd.is_none() {
                 ServiceState::Missing
             } else {
                 ServiceState::InstalledStopped
@@ -506,12 +822,189 @@ pub async fn scan_services() -> Vec<ServiceSnapshot> {
                 endpoint_ports: definition.ports.to_vec(),
                 reachable_port,
                 state,
+                systemd_unit: systemd.map(|unit| unit.name.clone()),
+                systemd_active_state: systemd.map(|unit| unit.active_state.clone()),
+                systemd_sub_state: systemd.map(|unit| unit.sub_state.clone()),
             }
         }
     }))
     .buffer_unordered(8)
     .collect()
     .await
+}
+
+#[derive(Clone)]
+struct SystemdUnitStatus {
+    name: String,
+    active_state: String,
+    sub_state: String,
+}
+
+async fn discover_systemd_units() -> HashMap<&'static str, SystemdUnitStatus> {
+    #[cfg(target_os = "linux")]
+    {
+        let Ok(units) = list_systemd_service_units().await else {
+            return HashMap::new();
+        };
+        let definitions = SERVICES.to_vec();
+        stream::iter(definitions.into_iter().map(|definition| {
+            let units = units.clone();
+            async move {
+                for candidate in definition.systemd_units {
+                    if !units.contains(*candidate) {
+                        continue;
+                    }
+                    if let Ok(Some(status)) = read_systemd_unit_status(candidate).await {
+                        return Some((definition.id, status));
+                    }
+                }
+                None
+            }
+        }))
+        .buffer_unordered(8)
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .flatten()
+        .collect()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        HashMap::new()
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn list_systemd_service_units() -> Result<HashSet<String>> {
+    let output = tokio::time::timeout(
+        Duration::from_secs(3),
+        Command::new("systemctl")
+            .args([
+                "--no-pager",
+                "list-unit-files",
+                "--type=service",
+                "--no-legend",
+            ])
+            .output(),
+    )
+    .await
+    .map_err(|_| anyhow!("timed out while querying systemd service units"))?
+    .context("running systemctl to discover host service units")?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "systemctl could not list service units: {}",
+            command_output_detail(&output.stderr)
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.split_whitespace().next())
+        .filter(|unit| unit.ends_with(".service"))
+        .map(str::to_string)
+        .collect())
+}
+
+#[cfg(target_os = "linux")]
+async fn read_systemd_unit_status(unit: &str) -> Result<Option<SystemdUnitStatus>> {
+    let output = tokio::time::timeout(
+        Duration::from_secs(3),
+        Command::new("systemctl")
+            .args([
+                "--no-pager",
+                "show",
+                "--property=LoadState",
+                "--property=ActiveState",
+                "--property=SubState",
+                unit,
+            ])
+            .output(),
+    )
+    .await
+    .map_err(|_| anyhow!("timed out while reading systemd unit {unit}"))?
+    .with_context(|| format!("reading systemd unit {unit}"))?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "systemctl could not read {unit}: {}",
+            command_output_detail(&output.stderr)
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let properties = stdout
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .map(|(name, value)| (name.to_string(), value.to_string()))
+        .collect::<HashMap<_, _>>();
+    if properties.get("LoadState").map(String::as_str) != Some("loaded") {
+        return Ok(None);
+    }
+    let Some(active_state) = properties.get("ActiveState") else {
+        return Ok(None);
+    };
+    let sub_state = properties
+        .get("SubState")
+        .map(String::as_str)
+        .unwrap_or("unknown");
+    Ok(Some(SystemdUnitStatus {
+        name: unit.to_string(),
+        active_state: active_state.clone(),
+        sub_state: sub_state.to_string(),
+    }))
+}
+
+#[cfg(target_os = "linux")]
+pub async fn control_host_service(service_id: &str, action: HostServiceAction) -> Result<()> {
+    let definition = SERVICES
+        .iter()
+        .find(|definition| definition.id == service_id)
+        .ok_or_else(|| anyhow!("unknown host service"))?;
+    let units = list_systemd_service_units().await?;
+    let unit = definition
+        .systemd_units
+        .iter()
+        .find(|candidate| units.contains(**candidate))
+        .copied()
+        .ok_or_else(|| {
+            anyhow!(
+                "no supported systemd service unit was found for {}",
+                definition.name
+            )
+        })?;
+
+    let mut command = Command::new("systemctl");
+    command
+        .args(["--no-pager", action.systemctl_verb(), unit])
+        .kill_on_drop(true);
+    let output = tokio::time::timeout(Duration::from_secs(90), command.output())
+        .await
+        .map_err(|_| {
+            anyhow!(
+                "timed out while asking systemd to {} {unit}",
+                action.systemctl_verb()
+            )
+        })?
+        .with_context(|| format!("asking systemd to {} {unit}", action.systemctl_verb()))?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "systemd could not {} {unit}: {}",
+            action.systemctl_verb(),
+            command_output_detail(&output.stderr)
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub async fn control_host_service(_service_id: &str, _action: HostServiceAction) -> Result<()> {
+    Err(anyhow!("host service controls require Linux with systemd"))
+}
+
+fn command_output_detail(bytes: &[u8]) -> String {
+    let detail = String::from_utf8_lossy(bytes).trim().to_string();
+    if detail.is_empty() {
+        "no additional details were returned".into()
+    } else {
+        detail.chars().take(600).collect()
+    }
 }
 
 fn discover_static() -> StaticDiscovery {

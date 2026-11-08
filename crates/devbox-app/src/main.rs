@@ -39,7 +39,7 @@ fn app_theme(app: &App) -> Theme {
     app.theme()
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum Page {
     Dashboard,
     Projects,
@@ -104,7 +104,7 @@ impl Page {
             Self::Workspaces => "Start related projects together in dependency order.",
             Self::Binaries => "Discover installed runtimes or register a specific executable.",
             Self::Processes => "Review process status and captured output.",
-            Self::Services => "Inspect host services and manage user-owned service processes.",
+            Self::Services => "Inspect host services and control recognized systemd units.",
             Self::Networking => "Generate and validate local Caddy routes for project domains.",
             Self::Extensions => "Review extension manifests and approve requested capabilities.",
             Self::Settings => "Choose where Devbox looks for runtimes and when it rescans.",
@@ -252,12 +252,13 @@ struct App {
     services: Vec<ServiceSnapshot>,
     managed_service_profiles: Vec<devbox_core::ManagedServiceProfile>,
     managed_service_states: Vec<devbox_core::ManagedServiceSnapshot>,
+    host_service_actions: HashSet<String>,
     workspaces: Vec<devbox_core::Workspace>,
     extensions: Vec<devbox_core::ExtensionRecord>,
     local_domains: Vec<devbox_core::LocalDomain>,
     page: Page,
     dark_mode: bool,
-    busy: bool,
+    pending_operations: HashMap<Page, usize>,
     status: Option<(bool, String)>,
     show_binary_form: bool,
     show_project_form: bool,
@@ -293,12 +294,13 @@ impl App {
             services: Vec::new(),
             managed_service_profiles: Vec::new(),
             managed_service_states: Vec::new(),
+            host_service_actions: HashSet::new(),
             workspaces: Vec::new(),
             extensions: Vec::new(),
             local_domains: Vec::new(),
             page: Page::Dashboard,
             dark_mode: false,
-            busy: false,
+            pending_operations: HashMap::new(),
             status: None,
             show_binary_form: false,
             show_project_form: false,
@@ -332,7 +334,7 @@ impl App {
             proxy_preview: String::new(),
         };
         let task = if let Some(core) = app.core.clone() {
-            app.busy = true;
+            begin_operation(&mut app, Page::Dashboard);
             Task::perform(
                 async move {
                     let binaries = core.initial_binaries().await;
@@ -400,7 +402,13 @@ enum Message {
     SaveBinary,
     BinarySaved(Result<Vec<BinaryRecord>, String>),
     RemoveBinary(String),
-    BinaryScanCompleted((Result<Vec<BinaryRecord>, String>, Vec<ServiceSnapshot>)),
+    BinaryScanCompleted(
+        (
+            Page,
+            Result<Vec<BinaryRecord>, String>,
+            Vec<ServiceSnapshot>,
+        ),
+    ),
     BinaryRemoved(Result<Vec<BinaryRecord>, String>),
     InspectPhpExtensions(String),
     PhpExtensionsInspected(String, Result<devbox_core::PhpExtensionReport, String>),
@@ -464,6 +472,17 @@ enum Message {
     StopManagedService(String),
     RestartManagedService(String),
     ManagedServiceActionDone(Result<(), String>),
+    HostServiceAction(String, devbox_core::HostServiceAction),
+    HostServiceActionDone(
+        (
+            String,
+            String,
+            String,
+            devbox_core::HostServiceAction,
+            Result<(), String>,
+            Vec<ServiceSnapshot>,
+        ),
+    ),
     WorkspaceNameChanged(String),
     WorkspaceSelected(WorkspaceChoice),
     WorkspaceProjectSelected(ProjectChoice),
@@ -510,7 +529,7 @@ enum Message {
 fn update(app: &mut App, message: Message) -> Task<Message> {
     match message {
         Message::InitialLoaded((binaries, projects, dark_mode, discovery_settings, services)) => {
-            app.busy = false;
+            finish_operation(app, Page::Dashboard);
             match binaries {
                 Ok(binaries) => app.binaries = binaries,
                 Err(error) => set_status(app, false, error),
@@ -708,7 +727,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                 set_status(app, false, "The application database is unavailable".into());
                 return Task::none();
             };
-            app.busy = true;
+            begin_operation(app, Page::Binaries);
             Task::perform(
                 async move {
                     let result = core.test_path(path.clone(), arguments, regex).await;
@@ -718,7 +737,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             )
         }
         Message::BinaryTested(path, result) => {
-            app.busy = false;
+            finish_operation(app, Page::Binaries);
             app.binary_form.probe = Some((path, result.clone()));
             if let Some(version) = result.version {
                 set_status(app, true, format!("Executable validated · {version}"));
@@ -735,7 +754,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
         }
         Message::SaveBinary => save_binary(app),
         Message::BinarySaved(result) => {
-            app.busy = false;
+            finish_operation(app, Page::Binaries);
             match result {
                 Ok(binaries) => {
                     app.binaries = binaries;
@@ -750,8 +769,8 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             }
             Task::none()
         }
-        Message::BinaryScanCompleted((result, services)) => {
-            app.busy = false;
+        Message::BinaryScanCompleted((page, result, services)) => {
+            finish_operation(app, page);
             app.services = services;
             match result {
                 Ok(binaries) => {
@@ -770,7 +789,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             Task::none()
         }
         Message::BinaryRemoved(result) => {
-            app.busy = false;
+            finish_operation(app, Page::Binaries);
             match result {
                 Ok(binaries) => {
                     app.binaries = binaries;
@@ -808,7 +827,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
         }
         Message::RemoveBinary(id) => {
             if let Some(core) = app.core.clone() {
-                app.busy = true;
+                begin_operation(app, Page::Binaries);
                 Task::perform(
                     async move {
                         core.remove_binary(id)
@@ -905,7 +924,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
         }
         Message::AddProject => add_project(app),
         Message::ProjectAdded(result) => {
-            app.busy = false;
+            finish_operation(app, Page::Projects);
             match result {
                 Ok(projects) => {
                     app.projects = projects;
@@ -1034,7 +1053,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
         }
         Message::SaveProjectConfig => save_project_configuration(app),
         Message::ProjectConfigSaved(result) => {
-            app.busy = false;
+            finish_operation(app, Page::Projects);
             match result {
                 Ok(projects) => {
                     app.projects = projects;
@@ -1051,7 +1070,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
         }
         Message::StartProject(id) => {
             if let Some(core) = app.core.clone() {
-                app.busy = true;
+                begin_operation(app, Page::Projects);
                 Task::perform(
                     async move {
                         core.start_project(id)
@@ -1065,7 +1084,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             }
         }
         Message::ProjectStarted(result) => {
-            app.busy = false;
+            finish_operation(app, Page::Projects);
             match result {
                 Ok(snapshot) => {
                     app.processes = app
@@ -1089,7 +1108,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
         }
         Message::StopProject(project_id) => {
             if let Some(core) = app.core.clone() {
-                app.busy = true;
+                begin_operation(app, Page::Projects);
                 let id = project_id.clone();
                 Task::perform(
                     async move {
@@ -1107,7 +1126,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             }
         }
         Message::ProjectStopped(project_id, result) => {
-            app.busy = false;
+            finish_operation(app, Page::Projects);
             app.processes = app
                 .core
                 .as_ref()
@@ -1125,7 +1144,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
         }
         Message::RestartProject(project_id) => {
             if let Some(core) = app.core.clone() {
-                app.busy = true;
+                begin_operation(app, Page::Projects);
                 Task::perform(
                     async move {
                         core.restart_project(project_id)
@@ -1139,7 +1158,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             }
         }
         Message::ProjectRestarted(result) => {
-            app.busy = false;
+            finish_operation(app, Page::Projects);
             app.processes = app
                 .core
                 .as_ref()
@@ -1210,7 +1229,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
         }
         Message::SaveDiscoverySettings => save_discovery_settings(app),
         Message::DiscoverySettingsSaved(result) => {
-            app.busy = false;
+            finish_operation(app, Page::Settings);
             match result {
                 Ok((directories, automatic_rescan)) => {
                     app.binary_search_directories = directories;
@@ -1304,7 +1323,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             let Some(core) = app.core.clone() else {
                 return Task::none();
             };
-            app.busy = true;
+            begin_operation(app, Page::Services);
             Task::perform(
                 async move {
                     core.save_managed_service_profile(profile)
@@ -1315,7 +1334,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             )
         }
         Message::ServiceProfileSaved(result) | Message::ManagedServiceProfilesChanged(result) => {
-            app.busy = false;
+            finish_operation(app, Page::Services);
             match result {
                 Ok(profiles) => {
                     app.managed_service_profiles = profiles;
@@ -1329,7 +1348,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             let Some(core) = app.core.clone() else {
                 return Task::none();
             };
-            app.busy = true;
+            begin_operation(app, Page::Services);
             Task::perform(
                 async move {
                     core.remove_managed_service_profile(id)
@@ -1343,7 +1362,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             let Some(core) = app.core.clone() else {
                 return Task::none();
             };
-            app.busy = true;
+            begin_operation(app, Page::Services);
             Task::perform(
                 async move {
                     core.start_managed_service(id)
@@ -1358,7 +1377,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             let Some(core) = app.core.clone() else {
                 return Task::none();
             };
-            app.busy = true;
+            begin_operation(app, Page::Services);
             Task::perform(
                 async move {
                     core.stop_managed_service(id)
@@ -1372,7 +1391,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             let Some(core) = app.core.clone() else {
                 return Task::none();
             };
-            app.busy = true;
+            begin_operation(app, Page::Services);
             Task::perform(
                 async move {
                     core.restart_managed_service(id)
@@ -1384,7 +1403,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             )
         }
         Message::ManagedServiceActionDone(result) => {
-            app.busy = false;
+            finish_operation(app, Page::Services);
             app.managed_service_states = app
                 .core
                 .as_ref()
@@ -1392,6 +1411,46 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                 .unwrap_or_default();
             match result {
                 Ok(()) => set_status(app, true, "Devbox-managed service action completed".into()),
+                Err(error) => set_status(app, false, error),
+            }
+            Task::none()
+        }
+        Message::HostServiceAction(id, action) => {
+            let Some(core) = app.core.clone() else {
+                return Task::none();
+            };
+            if app.host_service_actions.contains(&id) {
+                return Task::none();
+            }
+            let Some(service) = app.services.iter().find(|service| service.id == id) else {
+                set_status(
+                    app,
+                    false,
+                    "Host service is no longer in the scan results".into(),
+                );
+                return Task::none();
+            };
+            let name = service.name.clone();
+            let unit = service.systemd_unit.clone().unwrap_or_default();
+            app.host_service_actions.insert(id.clone());
+            let action_id = id.clone();
+            Task::perform(
+                async move {
+                    let result = core
+                        .control_host_service(id, action)
+                        .await
+                        .map_err(|error| error.to_string());
+                    let services = devbox_core::scan_services().await;
+                    (action_id, name, unit, action, result, services)
+                },
+                Message::HostServiceActionDone,
+            )
+        }
+        Message::HostServiceActionDone((id, name, unit, action, result, services)) => {
+            app.host_service_actions.remove(&id);
+            app.services = services;
+            match result {
+                Ok(()) => set_status(app, true, format!("{} {} ({unit})", action.label(), name)),
                 Err(error) => set_status(app, false, error),
             }
             Task::none()
@@ -1433,7 +1492,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                 );
                 return Task::none();
             };
-            app.busy = true;
+            begin_operation(app, Page::Workspaces);
             Task::perform(
                 async move {
                     core.attach_service_to_workspace(workspace.id, service)
@@ -1452,7 +1511,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             let Some(core) = app.core.clone() else {
                 return Task::none();
             };
-            app.busy = true;
+            begin_operation(app, Page::Workspaces);
             Task::perform(
                 async move {
                     core.create_workspace(name)
@@ -1463,7 +1522,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             )
         }
         Message::WorkspaceCreated(result) | Message::WorkspaceChanged(result) => {
-            app.busy = false;
+            finish_operation(app, Page::Workspaces);
             match result {
                 Ok(workspaces) => {
                     app.workspaces = workspaces;
@@ -1482,7 +1541,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                 set_status(app, false, "Select a workspace and a project".into());
                 return Task::none();
             };
-            app.busy = true;
+            begin_operation(app, Page::Workspaces);
             Task::perform(
                 async move {
                     core.add_project_to_workspace(workspace.id, project.id)
@@ -1506,7 +1565,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                 );
                 return Task::none();
             };
-            app.busy = true;
+            begin_operation(app, Page::Workspaces);
             Task::perform(
                 async move {
                     core.set_workspace_dependency(workspace.id, project.id, prerequisite.id, true)
@@ -1520,7 +1579,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             let Some(core) = app.core.clone() else {
                 return Task::none();
             };
-            app.busy = true;
+            begin_operation(app, Page::Workspaces);
             Task::perform(
                 async move {
                     core.start_workspace(id)
@@ -1534,7 +1593,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             let Some(core) = app.core.clone() else {
                 return Task::none();
             };
-            app.busy = true;
+            begin_operation(app, Page::Workspaces);
             Task::perform(
                 async move {
                     core.stop_workspace(id)
@@ -1546,7 +1605,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             )
         }
         Message::WorkspaceActionDone(result) => {
-            app.busy = false;
+            finish_operation(app, Page::Workspaces);
             app.processes = app
                 .core
                 .as_ref()
@@ -1567,7 +1626,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             let Some(core) = app.core.clone() else {
                 return Task::none();
             };
-            app.busy = true;
+            begin_operation(app, Page::Extensions);
             Task::perform(
                 async move {
                     core.register_extension(path)
@@ -1595,7 +1654,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             let Some(core) = app.core.clone() else {
                 return Task::none();
             };
-            app.busy = true;
+            begin_operation(app, Page::Extensions);
             Task::perform(
                 async move {
                     core.approve_extension_and_enable(id)
@@ -1609,7 +1668,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             let Some(core) = app.core.clone() else {
                 return Task::none();
             };
-            app.busy = true;
+            begin_operation(app, Page::Extensions);
             Task::perform(
                 async move {
                     core.disable_extension(id)
@@ -1623,7 +1682,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             let Some(core) = app.core.clone() else {
                 return Task::none();
             };
-            app.busy = true;
+            begin_operation(app, Page::Extensions);
             Task::perform(
                 async move {
                     core.remove_extension(id)
@@ -1634,7 +1693,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             )
         }
         Message::ExtensionsChanged(result) => {
-            app.busy = false;
+            finish_operation(app, Page::Extensions);
             match result {
                 Ok(extensions) => {
                     app.extensions = extensions;
@@ -1696,7 +1755,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                 upstream: app.domain_form.upstream.trim().into(),
                 websocket: app.domain_form.websocket,
             };
-            app.busy = true;
+            begin_operation(app, Page::Networking);
             Task::perform(
                 async move {
                     core.save_local_domain(route)
@@ -1707,7 +1766,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             )
         }
         Message::DomainSaved(result) => {
-            app.busy = false;
+            finish_operation(app, Page::Networking);
             match result {
                 Ok(domains) => {
                     app.local_domains = domains;
@@ -1721,7 +1780,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             let Some(core) = app.core.clone() else {
                 return Task::none();
             };
-            app.busy = true;
+            begin_operation(app, Page::Networking);
             Task::perform(
                 async move {
                     core.remove_local_domain(id)
@@ -1732,7 +1791,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             )
         }
         Message::DomainsChanged(result) => {
-            app.busy = false;
+            finish_operation(app, Page::Networking);
             match result {
                 Ok(domains) => {
                     app.local_domains = domains;
@@ -1776,7 +1835,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             let Some(core) = app.core.clone() else {
                 return Task::none();
             };
-            app.busy = true;
+            begin_operation(app, Page::Networking);
             Task::perform(
                 async move {
                     core.apply_proxy_config(executable, target)
@@ -1787,7 +1846,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             )
         }
         Message::ProxyConfigApplied(result) => {
-            app.busy = false;
+            finish_operation(app, Page::Networking);
             match result {
                 Ok(message) => set_status(app, true, message),
                 Err(error) => set_status(app, false, error),
@@ -1807,7 +1866,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             let Some(core) = app.core.clone() else {
                 return Task::none();
             };
-            app.busy = true;
+            begin_operation(app, Page::Networking);
             Task::perform(
                 async move {
                     core.restore_proxy_config(target)
@@ -1818,7 +1877,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             )
         }
         Message::ProxyConfigRestored(result) => {
-            app.busy = false;
+            finish_operation(app, Page::Networking);
             match result {
                 Ok(message) => set_status(app, true, message),
                 Err(error) => set_status(app, false, error),
@@ -1841,12 +1900,13 @@ fn subscription(_app: &App) -> Subscription<Message> {
 
 fn rescan(app: &mut App) -> Task<Message> {
     if let Some(core) = app.core.clone() {
-        app.busy = true;
+        let page = app.page;
+        begin_operation(app, page);
         Task::perform(
             async move {
                 let binaries = core.rescan_binaries().await;
                 let services = devbox_core::scan_services().await;
-                (binaries.map_err(|error| error.to_string()), services)
+                (page, binaries.map_err(|error| error.to_string()), services)
             },
             Message::BinaryScanCompleted,
         )
@@ -1885,7 +1945,7 @@ fn save_binary(app: &mut App) -> Task<Message> {
     let Some(core) = app.core.clone() else {
         return Task::none();
     };
-    app.busy = true;
+    begin_operation(app, Page::Binaries);
     Task::perform(
         async move {
             core.save_custom_binary(name, category, path, arguments, regex)
@@ -1913,7 +1973,7 @@ fn add_project(app: &mut App) -> Task<Message> {
         .map(|runtime| runtime.id.clone());
     let arguments = parse_arguments(&app.project_form.arguments);
     let environment_variables = app.project_form.environment_variables.clone();
-    app.busy = true;
+    begin_operation(app, Page::Projects);
     Task::perform(
         async move {
             core.add_project_with_environment(
@@ -1941,7 +2001,7 @@ fn save_project_configuration(app: &mut App) -> Task<Message> {
     let runtime_binary_id = form.runtime_binary_id.clone();
     let startup_arguments = parse_arguments(&form.arguments);
     let environment_variables = form.environment_variables.clone();
-    app.busy = true;
+    begin_operation(app, Page::Projects);
     Task::perform(
         async move {
             core.update_project_configuration(
@@ -1963,7 +2023,7 @@ fn save_discovery_settings(app: &mut App) -> Task<Message> {
     };
     let directories = app.binary_search_directories.clone();
     let automatic_rescan = app.automatic_rescan;
-    app.busy = true;
+    begin_operation(app, Page::Settings);
     Task::perform(
         async move {
             core.save_discovery_settings(directories, automatic_rescan)
@@ -2000,10 +2060,6 @@ fn view(app: &App) -> Element<'_, Message> {
     container(row![sidebar(app, palette), main].spacing(0))
         .width(Length::Fill)
         .height(Length::Fill)
-        .style(move |_| container::Style {
-            background: Some(Background::Color(palette.background)),
-            ..Default::default()
-        })
         .into()
 }
 
@@ -2115,9 +2171,6 @@ fn sidebar(app: &App, palette: Colors) -> Element<'_, Message> {
         text("Devbox 0.1 · Early milestone")
             .size(9)
             .color(palette.secondary),
-        text("Ctrl/⌘ + 1–9 · Tab through fields")
-            .size(9)
-            .color(palette.secondary),
     ]
     .spacing(9);
     container(
@@ -2137,7 +2190,7 @@ fn sidebar(app: &App, palette: Colors) -> Element<'_, Message> {
         border: Border {
             color: palette.separator,
             width: 1.0,
-            radius: 0.0.into(),
+            ..Default::default()
         },
         ..Default::default()
     })
@@ -2227,7 +2280,7 @@ fn toolbar(app: &App, palette: Colors) -> Element<'_, Message> {
             .spacing(7)
             .align_y(iced::Alignment::Center),
         )
-    } else if app.busy {
+    } else if page_is_busy(app, app.page) {
         Some(row![text("Working…").size(12).color(palette.secondary)])
     } else {
         None
@@ -3517,7 +3570,7 @@ fn settings_page(app: &App, palette: Colors) -> Element<'_, Message> {
         card(
             column![
                 text("Ownership and network safety").size(17).color(palette.text),
-                text("Host services found during scans are read-only. Devbox can stop only child process groups it started itself.")
+                text("Devbox-managed profiles are separate from host services. Recognized Linux systemd units can be controlled from Native Services and may require authorization.")
                     .size(12).color(palette.secondary),
                 text("Managed service data directories must already exist and belong to your user. Ports below 1024 are rejected.")
                     .size(12).color(palette.secondary),
@@ -3545,7 +3598,7 @@ fn services_page(app: &App, palette: Colors) -> Element<'_, Message> {
                 ]
                 .spacing(9)
                 .align_y(iced::Alignment::Center),
-                text("A managed profile launches only the executable and process group that you explicitly configured here. Detected host services below remain read-only; Devbox never stops an external process.")
+                text("Managed profiles run under Devbox. Recognized Linux systemd services can be started, stopped, or restarted here; systemd may request your authorization.")
                     .size(12)
                     .color(palette.secondary),
             ]
@@ -3585,8 +3638,14 @@ fn services_page(app: &App, palette: Colors) -> Element<'_, Message> {
                                     "Database".to_string(),
                                     "Cache".to_string(),
                                     "Email".to_string(),
+                                    "Message broker".to_string(),
+                                    "Search".to_string(),
+                                    "Service discovery".to_string(),
                                     "Object storage".to_string(),
+                                    "Local cloud".to_string(),
+                                    "Observability".to_string(),
                                     "Web server".to_string(),
+                                    "Container runtime".to_string(),
                                     "Other".to_string(),
                                 ],
                                 Some(app.service_form.kind.clone()),
@@ -3801,10 +3860,11 @@ fn services_page(app: &App, palette: Colors) -> Element<'_, Message> {
             palette,
         ));
     }
+    content = content.push(text("Host services · systemd").size(16).color(palette.text));
     content = content.push(
-        text("Detected host services · read only")
-            .size(16)
-            .color(palette.text),
+        text("Controls appear only for recognized service units. Service state below comes directly from systemd.")
+            .size(12)
+            .color(palette.secondary),
     );
     if app.services.is_empty() {
         content = content.push(empty_state(
@@ -3815,27 +3875,36 @@ fn services_page(app: &App, palette: Colors) -> Element<'_, Message> {
         ));
     }
     for service in &app.services {
+        let host_action_running = app.host_service_actions.contains(&service.id);
         let icon_name = match service.category.as_str() {
             "Database" => AppIcon::Database,
             "Cache" => AppIcon::Activity,
+            "Message broker" => AppIcon::Activity,
+            "Search" => AppIcon::Search,
+            "Service discovery" | "Container runtime" => AppIcon::Services,
+            "Observability" => AppIcon::Activity,
             "Web server" => AppIcon::Services,
             "Email" => AppIcon::Services,
+            "Object storage" | "Local cloud" => AppIcon::Services,
             _ => AppIcon::Binary,
         };
-        let state_detail = match &service.state {
-            ServiceState::Running => format!(
+        let state_detail = match (&service.state, service.systemd_active_state.as_deref()) {
+            (ServiceState::Running, Some("active")) if service.process_count == 0 => {
+                "systemd unit active · process owner not verified".into()
+            }
+            (ServiceState::Running, _) => format!(
                 "Detected {} matching process{} · owner not verified",
                 service.process_count,
                 if service.process_count == 1 { "" } else { "es" }
             ),
-            ServiceState::EndpointReachable => format!(
+            (ServiceState::EndpointReachable, _) => format!(
                 "TCP {} responds · process owner not identified",
                 service.reachable_port.unwrap_or_default()
             ),
-            ServiceState::InstalledStopped => {
-                "Server binary found · no matching process or endpoint".into()
+            (ServiceState::InstalledStopped, _) => {
+                "Service installed · no matching process or endpoint".into()
             }
-            ServiceState::Unhealthy => format!(
+            (ServiceState::Unhealthy, _) => format!(
                 "Matching process found · expected port{} {} not reachable",
                 if service.endpoint_ports.len() == 1 {
                     ""
@@ -3849,12 +3918,25 @@ fn services_page(app: &App, palette: Colors) -> Element<'_, Message> {
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
-            ServiceState::Missing => "No server binary or local endpoint detected".into(),
+            (ServiceState::Missing, _) => "No server binary or local endpoint detected".into(),
+        };
+        let systemd_detail = match (
+            service.systemd_unit.as_deref(),
+            service.systemd_active_state.as_deref(),
+            service.systemd_sub_state.as_deref(),
+        ) {
+            (Some(unit), Some(active), Some(sub)) => {
+                format!("{unit} · {active} ({sub})")
+            }
+            (Some(unit), Some(active), None) => format!("{unit} · {active}"),
+            (Some(unit), None, _) => format!("{unit} · status unavailable"),
+            (None, _, _) => "No matching systemd unit detected".into(),
         };
         let mut facts = vec![format!(
-            "{} · {} · external ownership unknown · read-only",
-            service.category, service.discovery_source,
+            "{} · {}",
+            service.category, service.discovery_source
         )];
+        facts.push(format!("Systemd: {systemd_detail}"));
         if let Some(path) = &service.executable_path {
             facts.push(path.clone());
         }
@@ -3869,6 +3951,50 @@ fn services_page(app: &App, palette: Colors) -> Element<'_, Message> {
                     .join(", ")
             ));
         }
+        let host_controls: Element<'_, Message> = match (
+            service.systemd_unit.as_deref(),
+            service.systemd_active_state.as_deref(),
+        ) {
+            (Some(_), Some("active")) if host_action_running => {
+                text("Working…").size(11).color(palette.secondary).into()
+            }
+            (Some(_), Some("active")) => row![
+                button(text("Restart").size(11))
+                    .padding([7, 9])
+                    .style(secondary_button_style(palette))
+                    .on_press(Message::HostServiceAction(
+                        service.id.clone(),
+                        devbox_core::HostServiceAction::Restart,
+                    )),
+                button(text("Stop").size(11))
+                    .padding([7, 9])
+                    .style(secondary_button_style(palette))
+                    .on_press(Message::HostServiceAction(
+                        service.id.clone(),
+                        devbox_core::HostServiceAction::Stop,
+                    )),
+            ]
+            .spacing(6)
+            .into(),
+            (Some(_), Some("inactive" | "failed")) if host_action_running => {
+                text("Working…").size(11).color(palette.secondary).into()
+            }
+            (Some(_), Some("inactive" | "failed")) => {
+                button(text("Start").size(11).color(Color::WHITE))
+                    .padding([7, 9])
+                    .style(primary_button_style(palette))
+                    .on_press(Message::HostServiceAction(
+                        service.id.clone(),
+                        devbox_core::HostServiceAction::Start,
+                    ))
+                    .into()
+            }
+            (Some(_), Some(_)) => text("Transitioning")
+                .size(11)
+                .color(palette.secondary)
+                .into(),
+            _ => text("Unavailable").size(11).color(palette.secondary).into(),
+        };
         let card_content = row![
             icon(icon_name, 22.0, palette.accent),
             column![
@@ -3885,7 +4011,7 @@ fn services_page(app: &App, palette: Colors) -> Element<'_, Message> {
             ]
             .spacing(5),
             iced::widget::Space::new().width(Length::Fill),
-            service_state_dot(&service.state, palette),
+            host_controls,
         ]
         .spacing(12)
         .align_y(iced::Alignment::Center);
@@ -4796,25 +4922,6 @@ fn status_dot(status: &ProcessStatus, palette: Colors) -> Element<'static, Messa
     .into()
 }
 
-fn service_state_dot(state: &ServiceState, palette: Colors) -> Element<'static, Message> {
-    let color = service_state_color(state, palette);
-    container(
-        iced::widget::Space::new()
-            .width(Length::Fixed(8.0))
-            .height(Length::Fixed(8.0)),
-    )
-    .style(move |_| container::Style {
-        background: Some(Background::Color(color)),
-        border: Border {
-            color: Color::TRANSPARENT,
-            width: 0.0,
-            radius: 10.0.into(),
-        },
-        ..Default::default()
-    })
-    .into()
-}
-
 fn service_state_color(state: &ServiceState, palette: Colors) -> Color {
     match state {
         ServiceState::Running => palette.success,
@@ -4877,6 +4984,27 @@ fn set_status(app: &mut App, success: bool, message: String) {
     app.status = Some((success, message));
 }
 
+fn begin_operation(app: &mut App, page: Page) {
+    *app.pending_operations.entry(page).or_default() += 1;
+}
+
+fn finish_operation(app: &mut App, page: Page) {
+    let Some(count) = app.pending_operations.get_mut(&page) else {
+        return;
+    };
+    if *count <= 1 {
+        app.pending_operations.remove(&page);
+    } else {
+        *count -= 1;
+    }
+}
+
+fn page_is_busy(app: &App, page: Page) -> bool {
+    app.pending_operations
+        .get(&page)
+        .is_some_and(|count| *count > 0)
+}
+
 fn nonempty(value: &str) -> Option<String> {
     (!value.trim().is_empty()).then(|| value.trim().to_string())
 }
@@ -4915,12 +5043,13 @@ mod tests {
             services: Vec::new(),
             managed_service_profiles: Vec::new(),
             managed_service_states: Vec::new(),
+            host_service_actions: HashSet::new(),
             workspaces: Vec::new(),
             extensions: Vec::new(),
             local_domains: Vec::new(),
             page: Page::Dashboard,
             dark_mode: false,
-            busy: false,
+            pending_operations: HashMap::new(),
             status: None,
             show_binary_form: false,
             show_project_form: false,
@@ -4956,14 +5085,14 @@ mod tests {
         assert!(app.show_project_form);
 
         let _ = update(&mut app, Message::AddProject);
-        assert!(!app.busy);
+        assert!(!page_is_busy(&app, Page::Projects));
         assert!(app.status.as_ref().is_some_and(|(success, message)| {
             !success && message.contains("Project name and directory are required")
         }));
 
         app.binary_form.path = "/path/that/does/not/exist".into();
         let _ = update(&mut app, Message::TestBinary);
-        assert!(app.busy);
+        assert!(page_is_busy(&app, Page::Binaries));
         let tested_path = app.binary_form.path.clone();
         let _ = update(
             &mut app,
@@ -4975,7 +5104,7 @@ mod tests {
                 },
             ),
         );
-        assert!(!app.busy);
+        assert!(!page_is_busy(&app, Page::Binaries));
         assert!(app.status.as_ref().is_some_and(|(success, message)| {
             !success && message.contains("could not be read")
         }));

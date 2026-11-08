@@ -26,7 +26,8 @@ pub use php_extensions::PhpExtensionReport;
 pub use process::ProcessManager;
 pub use project_detection::detect_frameworks;
 pub use services::{
-    ManagedServiceSnapshot, ServiceManager, ServiceSnapshot, ServiceState, scan_services,
+    HostServiceAction, ManagedServiceSnapshot, ServiceManager, ServiceSnapshot, ServiceState,
+    scan_services,
 };
 pub use storage::Storage;
 
@@ -531,6 +532,10 @@ impl Core {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
         self.services.start(&profile).await
+    }
+
+    pub async fn control_host_service(&self, id: String, action: HostServiceAction) -> Result<()> {
+        services::control_host_service(&id, action).await
     }
 
     pub async fn create_workspace(&self, name: String) -> Result<Vec<Workspace>> {
