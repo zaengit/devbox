@@ -1,6 +1,6 @@
 use crate::model::{
-    BinaryCategory, BinaryRecord, ExtensionRecord, LocalDomain, ManagedServiceProfile,
-    ProcessSnapshot, ProcessStatus, Project, Workspace,
+    BinaryCategory, BinaryRecord, EnvironmentVariable, ExtensionRecord, LocalDomain,
+    ManagedServiceProfile, ProcessSnapshot, ProcessStatus, Project, Workspace,
 };
 use anyhow::{Context, Result, anyhow};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -333,6 +333,39 @@ impl Storage {
         let updated = connection.execute(
             "UPDATE projects SET runtime_binary_id = ?2 WHERE id = ?1",
             params![project_id, binary_id],
+        )?;
+        if updated == 0 {
+            return Err(anyhow!("project no longer exists"));
+        }
+        Ok(())
+    }
+
+    pub fn update_project_configuration(
+        &self,
+        project_id: &str,
+        binary_id: Option<&str>,
+        startup_arguments: &[String],
+        environment_variables: &[EnvironmentVariable],
+    ) -> Result<()> {
+        let connection = self.connection()?;
+        if let Some(binary_id) = binary_id {
+            let binary_exists: bool = connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM detected_binaries WHERE id = ?1)",
+                [binary_id],
+                |row| row.get(0),
+            )?;
+            if !binary_exists {
+                return Err(anyhow!("runtime registration no longer exists"));
+            }
+        }
+        let updated = connection.execute(
+            "UPDATE projects SET runtime_binary_id = ?2, startup_arguments = ?3, environment_profile = ?4 WHERE id = ?1",
+            params![
+                project_id,
+                binary_id,
+                serde_json::to_string(startup_arguments)?,
+                serde_json::to_string(environment_variables)?,
+            ],
         )?;
         if updated == 0 {
             return Err(anyhow!("project no longer exists"));

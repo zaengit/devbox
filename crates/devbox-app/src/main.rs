@@ -74,7 +74,8 @@ impl Page {
             Self::Workspaces => AppIcon::Workspaces,
             Self::Binaries => AppIcon::Binary,
             Self::Processes => AppIcon::Logs,
-            Self::Services | Self::Networking => AppIcon::Services,
+            Self::Services => AppIcon::Services,
+            Self::Networking => AppIcon::Globe,
             Self::Extensions => AppIcon::Extensions,
             Self::Settings => AppIcon::Settings,
         }
@@ -231,6 +232,17 @@ struct ProjectForm {
     environment_variables: Vec<EnvironmentVariable>,
 }
 
+struct ProjectConfigForm {
+    project_id: String,
+    runtime: Option<RuntimeChoice>,
+    runtime_binary_id: Option<String>,
+    arguments: String,
+    environment_key: String,
+    environment_value: String,
+    environment_secret: bool,
+    environment_variables: Vec<EnvironmentVariable>,
+}
+
 struct App {
     core: Option<Core>,
     startup_error: Option<String>,
@@ -251,6 +263,7 @@ struct App {
     show_project_form: bool,
     binary_form: BinaryForm,
     project_form: ProjectForm,
+    project_config_form: Option<ProjectConfigForm>,
     log_query: String,
     log_stream: LogStreamChoice,
     binary_search_directories: Vec<String>,
@@ -297,6 +310,7 @@ impl App {
                 environment_secret: true,
                 ..Default::default()
             },
+            project_config_form: None,
             log_query: String::new(),
             log_stream: LogStreamChoice::All,
             binary_search_directories: Vec::new(),
@@ -403,8 +417,18 @@ enum Message {
     ProjectRuntimeSelected(RuntimeChoice),
     AddProject,
     ProjectAdded(Result<Vec<Project>, String>),
-    ProjectRuntimeChanged(String, RuntimeChoice),
-    ProjectsChanged(Result<Vec<Project>, String>),
+    OpenProjectConfig(String),
+    CloseProjectConfig,
+    ProjectConfigRuntimeSelected(RuntimeChoice),
+    ProjectConfigUseHostDefault,
+    ProjectConfigArgumentsChanged(String),
+    ProjectConfigEnvironmentKeyChanged(String),
+    ProjectConfigEnvironmentValueChanged(String),
+    ProjectConfigEnvironmentSecretChanged(bool),
+    AddProjectConfigEnvironmentVariable,
+    RemoveProjectConfigEnvironmentVariable(String),
+    SaveProjectConfig,
+    ProjectConfigSaved(Result<Vec<Project>, String>),
     StartProject(String),
     ProjectStarted(Result<ProcessSnapshot, String>),
     StopProject(String),
@@ -894,31 +918,136 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             }
             Task::none()
         }
-        Message::ProjectsChanged(result) => {
-            app.busy = false;
-            match result {
-                Ok(projects) => {
-                    app.projects = projects;
-                    set_status(app, true, "Project runtime selection saved".into());
+        Message::OpenProjectConfig(project_id) => {
+            if app
+                .project_config_form
+                .as_ref()
+                .is_some_and(|form| form.project_id == project_id)
+            {
+                app.project_config_form = None;
+                app.status = None;
+                return Task::none();
+            }
+            let choices = runtime_choices(&app.binaries);
+            if let Some(project) = app.projects.iter().find(|p| p.id == project_id) {
+                let runtime_binary_id = project.runtime_binary_id.clone();
+                let runtime = runtime_binary_id
+                    .as_ref()
+                    .and_then(|id| choices.iter().find(|choice| &choice.id == id).cloned());
+                app.project_config_form = Some(ProjectConfigForm {
+                    project_id,
+                    runtime,
+                    runtime_binary_id,
+                    arguments: project.startup_arguments.join(" "),
+                    environment_key: String::new(),
+                    environment_value: String::new(),
+                    environment_secret: true,
+                    environment_variables: project.environment_variables.clone(),
+                });
+                app.status = None;
+            }
+            Task::none()
+        }
+        Message::CloseProjectConfig => {
+            app.project_config_form = None;
+            app.status = None;
+            Task::none()
+        }
+        Message::ProjectConfigRuntimeSelected(value) => {
+            if let Some(form) = &mut app.project_config_form {
+                form.runtime_binary_id = Some(value.id.clone());
+                form.runtime = Some(value);
+            }
+            Task::none()
+        }
+        Message::ProjectConfigUseHostDefault => {
+            if let Some(form) = &mut app.project_config_form {
+                form.runtime_binary_id = None;
+                form.runtime = None;
+            }
+            Task::none()
+        }
+        Message::ProjectConfigArgumentsChanged(value) => {
+            if let Some(form) = &mut app.project_config_form {
+                form.arguments = value;
+            }
+            Task::none()
+        }
+        Message::ProjectConfigEnvironmentKeyChanged(value) => {
+            if let Some(form) = &mut app.project_config_form {
+                form.environment_key = value;
+            }
+            Task::none()
+        }
+        Message::ProjectConfigEnvironmentValueChanged(value) => {
+            if let Some(form) = &mut app.project_config_form {
+                form.environment_value = value;
+            }
+            Task::none()
+        }
+        Message::ProjectConfigEnvironmentSecretChanged(secret) => {
+            if let Some(form) = &mut app.project_config_form {
+                form.environment_secret = secret;
+            }
+            Task::none()
+        }
+        Message::AddProjectConfigEnvironmentVariable => {
+            let validation = if let Some(form) = &mut app.project_config_form {
+                let key = form.environment_key.trim().to_string();
+                let value = form.environment_value.clone();
+                if key.is_empty() {
+                    Err("Enter an environment variable name".to_string())
+                } else if form
+                    .environment_variables
+                    .iter()
+                    .any(|variable| variable.key == key)
+                {
+                    Err(format!("{key} is already in this project profile"))
+                } else if value.is_empty() {
+                    Err("Enter a value for this environment variable".to_string())
+                } else {
+                    form.environment_variables.push(EnvironmentVariable {
+                        key,
+                        value,
+                        secret: form.environment_secret,
+                    });
+                    form.environment_key.clear();
+                    form.environment_value.clear();
+                    form.environment_secret = true;
+                    Ok(())
                 }
+            } else {
+                return Task::none();
+            };
+            match validation {
+                Ok(()) => app.status = None,
                 Err(error) => set_status(app, false, error),
             }
             Task::none()
         }
-        Message::ProjectRuntimeChanged(project_id, choice) => {
-            if let Some(core) = app.core.clone() {
-                app.busy = true;
-                Task::perform(
-                    async move {
-                        core.assign_runtime(project_id, Some(choice.id))
-                            .await
-                            .map_err(|error| error.to_string())
-                    },
-                    Message::ProjectsChanged,
-                )
-            } else {
-                Task::none()
+        Message::RemoveProjectConfigEnvironmentVariable(key) => {
+            if let Some(form) = &mut app.project_config_form {
+                form.environment_variables
+                    .retain(|variable| variable.key != key);
             }
+            Task::none()
+        }
+        Message::SaveProjectConfig => save_project_configuration(app),
+        Message::ProjectConfigSaved(result) => {
+            app.busy = false;
+            match result {
+                Ok(projects) => {
+                    app.projects = projects;
+                    app.project_config_form = None;
+                    set_status(
+                        app,
+                        true,
+                        "Project configuration saved · changes apply on next start".into(),
+                    );
+                }
+                Err(error) => set_status(app, false, error),
+            }
+            Task::none()
         }
         Message::StartProject(id) => {
             if let Some(core) = app.core.clone() {
@@ -1801,6 +1930,33 @@ fn add_project(app: &mut App) -> Task<Message> {
     )
 }
 
+fn save_project_configuration(app: &mut App) -> Task<Message> {
+    let Some(core) = app.core.clone() else {
+        return Task::none();
+    };
+    let Some(form) = app.project_config_form.as_ref() else {
+        return Task::none();
+    };
+    let project_id = form.project_id.clone();
+    let runtime_binary_id = form.runtime_binary_id.clone();
+    let startup_arguments = parse_arguments(&form.arguments);
+    let environment_variables = form.environment_variables.clone();
+    app.busy = true;
+    Task::perform(
+        async move {
+            core.update_project_configuration(
+                project_id,
+                runtime_binary_id,
+                startup_arguments,
+                environment_variables,
+            )
+            .await
+            .map_err(|error| error.to_string())
+        },
+        Message::ProjectConfigSaved,
+    )
+}
+
 fn save_discovery_settings(app: &mut App) -> Task<Message> {
     let Some(core) = app.core.clone() else {
         return Task::none();
@@ -1867,7 +2023,7 @@ fn sidebar(app: &App, palette: Colors) -> Element<'_, Message> {
             vec![
                 (Page::Processes, AppIcon::Logs),
                 (Page::Services, AppIcon::Services),
-                (Page::Networking, AppIcon::Services),
+                (Page::Networking, AppIcon::Globe),
             ],
         ),
         ("Tools", vec![(Page::Extensions, AppIcon::Extensions)]),
@@ -2109,13 +2265,13 @@ fn scroll_area<'a>(
     content: impl Into<Element<'a, Message>>,
     height: Length,
 ) -> Element<'a, Message> {
-    scrollable(
-        container(content)
-            .width(Length::Fill)
-            .padding(iced::Padding::default().right(14.0)),
-    )
-    .height(height)
-    .into()
+    scrollable(container(content).width(Length::Fill))
+        .direction(iced::widget::scrollable::Direction::Vertical(
+            iced::widget::scrollable::Scrollbar::new().spacing(8.0),
+        ))
+        .width(Length::Fill)
+        .height(height)
+        .into()
 }
 
 fn dashboard(app: &App, palette: Colors) -> Element<'_, Message> {
@@ -2441,18 +2597,6 @@ fn projects_page(app: &App, palette: Colors) -> Element<'_, Message> {
                     ProcessStatus::Running | ProcessStatus::Stopping
                 )
         });
-        let selected = project
-            .runtime_binary_id
-            .as_ref()
-            .and_then(|id| choices.iter().find(|choice| &choice.id == id).cloned());
-        let project_id_for_change = project.id.clone();
-        let runtime_picker = pick_list(choices.clone(), selected, move |choice| {
-            Message::ProjectRuntimeChanged(project_id_for_change.clone(), choice)
-        })
-        .placeholder("Choose runtime")
-        .padding([9, 11])
-        .style(pick_list_style(palette))
-        .menu_style(pick_menu_style(palette));
         let start_stop = if active.is_some() {
             button(
                 row![
@@ -2479,57 +2623,238 @@ fn projects_page(app: &App, palette: Colors) -> Element<'_, Message> {
             .on_press(Message::StartProject(project.id.clone()))
         };
         let runtime_label = selected_runtime_label(project, &app.binaries);
-        let item = card(
-            column![
-                row![
-                    icon(AppIcon::Projects, 20.0, palette.accent),
-                    column![
-                        text(&project.name).size(15).color(palette.text),
-                        text(&project.path).size(11).color(palette.secondary),
-                        text(if project.detected_frameworks.is_empty() {
-                            "Framework not detected".to_string()
-                        } else {
-                            format!("Detected: {}", project.detected_frameworks.join(", "))
-                        })
-                        .size(10)
-                        .color(palette.secondary),
-                    ]
-                    .spacing(5),
-                    iced::widget::Space::new().width(Length::Fill),
-                    status_dot(
-                        active.map(|p| &p.status).unwrap_or(&ProcessStatus::Exited),
-                        palette
-                    ),
-                    text(active.map(|p| status_label(&p.status)).unwrap_or("Stopped"))
-                        .size(12)
-                        .color(palette.secondary),
-                ]
-                .spacing(11)
-                .align_y(iced::Alignment::Center),
-                row![
-                    text(format!("Runtime: {runtime_label}"))
-                        .size(12)
-                        .color(palette.secondary),
-                    iced::widget::Space::new().width(Length::Fill),
-                    runtime_picker,
-                    start_stop,
-                ]
-                .spacing(9)
-                .align_y(iced::Alignment::Center),
-                text(if project.startup_arguments.is_empty() {
-                    "Arguments: none".to_string()
+        let config_is_open = app
+            .project_config_form
+            .as_ref()
+            .is_some_and(|form| form.project_id == project.id);
+        let configure = button(
+            row![
+                icon(AppIcon::Settings, 14.0, palette.secondary),
+                text(if config_is_open {
+                    "Close config"
                 } else {
-                    format!("Arguments: {}", project.startup_arguments.join(" "))
+                    "Configure"
                 })
-                .size(11)
-                .color(palette.secondary),
+                .size(12)
+                .color(palette.text)
             ]
-            .spacing(12),
-            palette,
-        );
+            .spacing(7)
+            .align_y(iced::Alignment::Center),
+        )
+        .padding([8, 11])
+        .style(secondary_button_style(palette))
+        .on_press(Message::OpenProjectConfig(project.id.clone()));
+        let config_editor = app
+            .project_config_form
+            .as_ref()
+            .filter(|form| form.project_id == project.id)
+            .map(|form| project_config_editor(form, choices.clone(), palette, active.is_some()));
+        let mut item_content = column![
+            row![
+                icon(AppIcon::Projects, 20.0, palette.accent),
+                column![
+                    text(&project.name).size(15).color(palette.text),
+                    text(&project.path).size(11).color(palette.secondary),
+                    text(if project.detected_frameworks.is_empty() {
+                        "Framework not detected".to_string()
+                    } else {
+                        format!("Detected: {}", project.detected_frameworks.join(", "))
+                    })
+                    .size(10)
+                    .color(palette.secondary),
+                ]
+                .spacing(5),
+                iced::widget::Space::new().width(Length::Fill),
+                status_dot(
+                    active.map(|p| &p.status).unwrap_or(&ProcessStatus::Exited),
+                    palette
+                ),
+                text(active.map(|p| status_label(&p.status)).unwrap_or("Stopped"))
+                    .size(12)
+                    .color(palette.secondary),
+            ]
+            .spacing(11)
+            .align_y(iced::Alignment::Center),
+            row![
+                text(format!("Runtime: {runtime_label}"))
+                    .size(12)
+                    .color(palette.secondary),
+                iced::widget::Space::new().width(Length::Fill),
+                configure,
+                start_stop,
+            ]
+            .spacing(9)
+            .align_y(iced::Alignment::Center),
+            text(if project.startup_arguments.is_empty() {
+                "Arguments: none".to_string()
+            } else {
+                format!("Arguments: {}", project.startup_arguments.join(" "))
+            })
+            .size(11)
+            .color(palette.secondary),
+        ]
+        .spacing(12);
+        if let Some(config_editor) = config_editor {
+            item_content = item_content.push(config_editor);
+        }
+        let item = card(item_content, palette);
         content = content.push(item);
     }
     scroll_area(content, Length::Fill)
+}
+
+fn project_config_editor<'a>(
+    form: &'a ProjectConfigForm,
+    choices: Vec<RuntimeChoice>,
+    palette: Colors,
+    is_running: bool,
+) -> Element<'a, Message> {
+    let runtime_placeholder = if form.runtime_binary_id.is_some() && form.runtime.is_none() {
+        "Registered runtime unavailable"
+    } else {
+        "Use host default"
+    };
+    let runtime_picker = pick_list(
+        choices,
+        form.runtime.clone(),
+        Message::ProjectConfigRuntimeSelected,
+    )
+    .placeholder(runtime_placeholder)
+    .padding([9, 11])
+    .style(pick_list_style(palette))
+    .menu_style(pick_menu_style(palette))
+    .width(Length::Fill);
+    let use_host_default: Element<'a, Message> = if form.runtime_binary_id.is_some() {
+        button(text("Host default").size(11).color(palette.secondary))
+            .padding([9, 10])
+            .style(secondary_button_style(palette))
+            .on_press(Message::ProjectConfigUseHostDefault)
+            .into()
+    } else {
+        iced::widget::Space::new().width(Length::Shrink).into()
+    };
+    let mut environment_rows = column![].spacing(7);
+    if form.environment_variables.is_empty() {
+        environment_rows = environment_rows.push(
+            text("No environment variables configured")
+                .size(11)
+                .color(palette.secondary),
+        );
+    }
+    for variable in &form.environment_variables {
+        let displayed_value = if variable.secret {
+            "••••••••".to_string()
+        } else {
+            variable.value.clone()
+        };
+        let key = variable.key.clone();
+        environment_rows = environment_rows.push(
+            row![
+                text(format!("{} = {}", variable.key, displayed_value))
+                    .size(11)
+                    .color(palette.text),
+                text(if variable.secret {
+                    "Sensitive"
+                } else {
+                    "Visible"
+                })
+                .size(10)
+                .color(palette.secondary),
+                iced::widget::Space::new().width(Length::Fill),
+                button(text("Remove").size(10).color(palette.error))
+                    .padding([5, 8])
+                    .style(secondary_button_style(palette))
+                    .on_press(Message::RemoveProjectConfigEnvironmentVariable(key)),
+            ]
+            .spacing(8)
+            .align_y(iced::Alignment::Center),
+        );
+    }
+    let runtime_and_arguments = row![
+        form_field(
+            "Runtime",
+            row![runtime_picker, use_host_default]
+                .spacing(7)
+                .align_y(iced::Alignment::Center),
+            Length::FillPortion(1),
+            palette,
+        ),
+        form_field(
+            "Startup arguments",
+            text_input("e.g. dev --port 3000", &form.arguments)
+                .on_input(Message::ProjectConfigArgumentsChanged)
+                .padding([9, 11])
+                .style(text_input_style(palette))
+                .width(Length::Fill),
+            Length::FillPortion(2),
+            palette,
+        ),
+    ]
+    .spacing(10);
+    let environment_add = row![
+        form_field(
+            "Variable name",
+            text_input("e.g. APP_ENV", &form.environment_key)
+                .on_input(Message::ProjectConfigEnvironmentKeyChanged)
+                .padding([9, 11])
+                .style(text_input_style(palette))
+                .width(Length::Fill),
+            Length::FillPortion(1),
+            palette,
+        ),
+        form_field(
+            "Value",
+            text_input("Environment value", &form.environment_value)
+                .on_input(Message::ProjectConfigEnvironmentValueChanged)
+                .secure(form.environment_secret)
+                .padding([9, 11])
+                .style(text_input_style(palette))
+                .width(Length::Fill),
+            Length::FillPortion(2),
+            palette,
+        ),
+        checkbox(form.environment_secret)
+            .label("Sensitive")
+            .on_toggle(Message::ProjectConfigEnvironmentSecretChanged)
+            .style(checkbox_style(palette)),
+        button(text("Add variable").size(11).color(palette.accent))
+            .padding([9, 11])
+            .style(secondary_button_style(palette))
+            .on_press(Message::AddProjectConfigEnvironmentVariable),
+    ]
+    .spacing(9)
+    .align_y(iced::Alignment::End);
+    let next_start_note = if is_running {
+        "Changes apply the next time this project starts. The running process continues unchanged."
+    } else {
+        "These settings will be used the next time you start this project."
+    };
+    form_group(
+        column![
+            runtime_and_arguments,
+            text("Environment variables").size(13).color(palette.text),
+            environment_rows,
+            environment_add,
+            row![
+                text(next_start_note)
+                    .size(11)
+                    .color(palette.secondary)
+                    .width(Length::Fill),
+                button(text("Cancel").size(12))
+                    .padding([9, 12])
+                    .style(secondary_button_style(palette))
+                    .on_press(Message::CloseProjectConfig),
+                button(text("Save configuration").size(12).color(Color::WHITE))
+                    .padding([9, 12])
+                    .style(primary_button_style(palette))
+                    .on_press(Message::SaveProjectConfig),
+            ]
+            .spacing(9)
+            .align_y(iced::Alignment::Center),
+        ]
+        .spacing(11),
+        palette,
+    )
 }
 
 fn binaries_page(app: &App, palette: Colors) -> Element<'_, Message> {
@@ -2822,18 +3147,28 @@ fn binaries_page(app: &App, palette: Colors) -> Element<'_, Message> {
             row![
                 icon(symbol, 21.0, palette.accent),
                 column![
-                    text(&binary.display_name).size(14).color(palette.text),
                     row![
-                        text(binary.category.as_str())
-                            .width(Length::Fixed(82.0))
-                            .size(10)
-                            .color(palette.secondary),
-                        text(&binary.executable_path)
-                            .size(11)
-                            .color(palette.secondary),
+                        text(&binary.display_name).size(14).color(palette.text),
+                        container(
+                            text(binary.category.as_str())
+                                .size(10)
+                                .color(palette.accent),
+                        )
+                        .padding([3, 7])
+                        .style(move |_| container::Style {
+                            background: Some(Background::Color(palette.nav_selected)),
+                            border: Border {
+                                radius: 6.0.into(),
+                                ..Default::default()
+                            },
+                            ..Default::default()
+                        }),
                     ]
                     .spacing(8)
                     .align_y(iced::Alignment::Center),
+                    text(&binary.executable_path)
+                        .size(11)
+                        .color(palette.secondary),
                     text(format!(
                         "{} · {}",
                         binary.discovery_source, binary.trust_status
@@ -4594,6 +4929,7 @@ mod tests {
                 ..Default::default()
             },
             project_form: ProjectForm::default(),
+            project_config_form: None,
             log_query: String::new(),
             log_stream: LogStreamChoice::All,
             binary_search_directories: Vec::new(),

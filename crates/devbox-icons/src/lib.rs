@@ -13,6 +13,7 @@ pub enum AppIcon {
     Binary,
     Database,
     Services,
+    Globe,
     Extensions,
     Settings,
     Search,
@@ -32,7 +33,7 @@ pub enum AppIcon {
 }
 
 impl AppIcon {
-    pub const ALL: [Self; 24] = [
+    pub const ALL: [Self; 25] = [
         Self::Dashboard,
         Self::Activity,
         Self::Projects,
@@ -41,6 +42,7 @@ impl AppIcon {
         Self::Binary,
         Self::Database,
         Self::Services,
+        Self::Globe,
         Self::Extensions,
         Self::Settings,
         Self::Search,
@@ -70,6 +72,7 @@ fn bytes(icon: AppIcon) -> &'static [u8] {
         AppIcon::Binary => include_bytes!("../../../assets/icons/binary.svg"),
         AppIcon::Database => include_bytes!("../../../assets/icons/database.svg"),
         AppIcon::Services => include_bytes!("../../../assets/icons/server.svg"),
+        AppIcon::Globe => include_bytes!("../../../assets/icons/globe.svg"),
         AppIcon::Extensions => include_bytes!("../../../assets/icons/puzzle.svg"),
         AppIcon::Settings => include_bytes!("../../../assets/icons/settings.svg"),
         AppIcon::Search => include_bytes!("../../../assets/icons/search.svg"),

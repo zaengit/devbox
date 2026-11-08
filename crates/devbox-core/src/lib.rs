@@ -350,6 +350,35 @@ impl Core {
         Ok(projects)
     }
 
+    pub async fn update_project_configuration(
+        &self,
+        project_id: String,
+        runtime_binary_id: Option<String>,
+        startup_arguments: Vec<String>,
+        environment_variables: Vec<EnvironmentVariable>,
+    ) -> Result<Vec<Project>> {
+        if startup_arguments.len() > 128
+            || startup_arguments
+                .iter()
+                .any(|argument| argument.contains('\0'))
+        {
+            return Err(anyhow!("project startup arguments contain invalid values"));
+        }
+        let environment_variables = validate_environment_variables(environment_variables)?;
+        let storage = self.storage.clone();
+        let projects = tokio::task::spawn_blocking(move || -> Result<Vec<Project>> {
+            storage.update_project_configuration(
+                &project_id,
+                runtime_binary_id.as_deref(),
+                &startup_arguments,
+                &environment_variables,
+            )?;
+            storage.list_projects()
+        })
+        .await??;
+        Ok(projects)
+    }
+
     pub async fn start_project(&self, project_id: String) -> Result<ProcessSnapshot> {
         let (project, resolved) = self.project_runtime(project_id).await?;
         self.processes
